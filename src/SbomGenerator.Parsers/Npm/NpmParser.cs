@@ -110,7 +110,10 @@ public class NpmParser : IPackageParser
 
     private List<Package> ParsePackageLock(JsonElement root, string lockFilePath)
     {
+        // Map by name@version for deduplication (final output)
         var packageMap = new Dictionary<string, Package>();
+        // Map by full path for resolution (e.g., "node_modules/express/node_modules/lodash")
+        var pathMap = new Dictionary<string, Package>();
 
         // First, get the list of direct dependencies from the root package entry
         var directDeps = new HashSet<string>();
@@ -136,7 +139,7 @@ public class NpmParser : IPackageParser
         // Handle lockfileVersion 2/3 format (packages object)
         if (root.TryGetProperty("packages", out var pkgs))
         {
-            // First pass: Create all packages
+            // First pass: Create all packages and store by both path and name@version
             foreach (var pkg in pkgs.EnumerateObject())
             {
                 // Skip root package (empty key)
@@ -145,14 +148,14 @@ public class NpmParser : IPackageParser
                     continue;
                 }
 
-                // Extract package name from node_modules path
-                var name = ExtractPackageName(pkg.Name);
+                var path = pkg.Name; // Full path like "node_modules/express/node_modules/lodash"
+                var name = ExtractPackageName(path);
                 if (string.IsNullOrEmpty(name)) continue;
 
                 var version = pkg.Value.TryGetProperty("version", out var v) ? v.GetString() : null;
                 if (string.IsNullOrEmpty(version)) continue;
 
-                // Determine if this is a direct dependency
+                // Determine if this is a direct dependency (top-level in node_modules)
                 var isDirect = directDeps.Contains(name);
 
                 var package = new Package
@@ -182,22 +185,29 @@ public class NpmParser : IPackageParser
                     package.License = license.GetString();
                 }
 
-                // Use name@version as key to handle multiple versions
+                // Store by path for resolution
+                pathMap[path] = package;
+
+                // Store by name@version for deduplication (keep first occurrence)
                 var key = $"{name}@{version}";
-                packageMap[key] = package;
+                if (!packageMap.ContainsKey(key))
+                {
+                    packageMap[key] = package;
+                }
             }
 
-            // Second pass: Build dependency relationships
+            // Second pass: Build dependency relationships using path-aware resolution
             foreach (var pkg in pkgs.EnumerateObject())
             {
                 if (string.IsNullOrEmpty(pkg.Name)) continue;
 
-                var name = ExtractPackageName(pkg.Name);
+                var parentPath = pkg.Name;
+                var name = ExtractPackageName(parentPath);
                 var version = pkg.Value.TryGetProperty("version", out var v) ? v.GetString() : null;
                 if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(version)) continue;
 
-                var key = $"{name}@{version}";
-                if (!packageMap.TryGetValue(key, out var package)) continue;
+                // Get the package from pathMap to ensure we're updating the right instance
+                if (!pathMap.TryGetValue(parentPath, out var package)) continue;
 
                 // Parse this package's dependencies
                 if (pkg.Value.TryGetProperty("dependencies", out var deps))
@@ -207,8 +217,8 @@ public class NpmParser : IPackageParser
                         var depName = dep.Name;
                         var depVersionRange = dep.Value.GetString() ?? "*";
 
-                        // Find the resolved version in our package map
-                        var resolvedPackage = FindResolvedPackage(packageMap, depName, depVersionRange);
+                        // Find the resolved package using path-aware resolution
+                        var resolvedPackage = FindResolvedPackageByPath(pathMap, parentPath, depName);
 
                         package.Dependencies.Add(new PackageDependency
                         {
@@ -232,7 +242,61 @@ public class NpmParser : IPackageParser
     }
 
     /// <summary>
+    /// Finds a resolved package by walking up the node_modules path hierarchy.
+    /// Mimics Node.js module resolution algorithm.
+    /// </summary>
+    private static Package? FindResolvedPackageByPath(
+        Dictionary<string, Package> pathMap, 
+        string parentPath, 
+        string depName)
+    {
+        // Start from parent's location and walk up looking for the dependency
+        // Example: For parent "node_modules/express" looking for "lodash":
+        //   1. Try "node_modules/express/node_modules/lodash"
+        //   2. Try "node_modules/lodash"
+
+        var currentPath = parentPath;
+
+        while (!string.IsNullOrEmpty(currentPath))
+        {
+            // Try to find dependency nested under current path
+            var depPath = $"{currentPath}/node_modules/{depName}";
+            if (pathMap.TryGetValue(depPath, out var found))
+            {
+                return found;
+            }
+
+            // Move up to parent node_modules
+            var lastNodeModulesIndex = currentPath.LastIndexOf("/node_modules/");
+            if (lastNodeModulesIndex > 0)
+            {
+                // Go up one level: "node_modules/a/node_modules/b" -> "node_modules/a"
+                currentPath = currentPath[..lastNodeModulesIndex];
+            }
+            else if (currentPath.StartsWith("node_modules/"))
+            {
+                // We're at top-level, try root node_modules
+                currentPath = "";
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        // Final try: top-level node_modules
+        var topLevelPath = $"node_modules/{depName}";
+        if (pathMap.TryGetValue(topLevelPath, out var topLevel))
+        {
+            return topLevel;
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Finds a resolved package by name, preferring exact version match.
+    /// Used for lockfile v1 and fallback scenarios.
     /// </summary>
     private static Package? FindResolvedPackage(Dictionary<string, Package> packageMap, string name, string versionRange)
     {
@@ -244,8 +308,9 @@ public class NpmParser : IPackageParser
             return exactMatch;
         }
 
-        // Otherwise find any version of this package
-        return packageMap.Values.FirstOrDefault(p => p.Name == name);
+        // Don't fall back to any version - that's what causes version mismatches
+        // Return null if exact version not found
+        return null;
     }
 
     private static string ExtractPackageName(string nodePath)
@@ -369,10 +434,15 @@ public class NpmParser : IPackageParser
         IReadOnlyList<Package> packages,
         CancellationToken cancellationToken = default)
     {
-        // Check if all packages came from a lock file (they'll have resolved URLs)
-        var allFromLockFile = packages.All(p => !string.IsNullOrEmpty(p.DownloadUrl) || !string.IsNullOrEmpty(p.Sha256));
+        // Check if ANY package came from a lock file (has integrity hash or resolved URL)
+        // Lock files contain the COMPLETE dependency tree, so if we parsed one, 
+        // we should NOT fall back to registry resolution
+        var anyFromLockFile = packages.Any(p => 
+            !string.IsNullOrEmpty(p.Sha256) || 
+            !string.IsNullOrEmpty(p.DownloadUrl) ||
+            p.Dependencies.Count > 0);
 
-        if (allFromLockFile)
+        if (anyFromLockFile)
         {
             // Lock file already contains complete dependency tree - just enrich with metadata
             _logger.LogDebug("Packages from lock file - skipping registry resolution, enriching metadata only");

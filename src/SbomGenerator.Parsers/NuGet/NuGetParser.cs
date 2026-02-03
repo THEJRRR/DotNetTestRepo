@@ -11,16 +11,18 @@ using SbomGenerator.Core.Models;
 namespace SbomGenerator.Parsers.NuGet;
 
 /// <summary>
-/// Parser for NuGet project files (*.csproj, packages.config, etc.)
+/// Parser for NuGet project files and lock files.
+/// Prefers packages.lock.json as the source of truth when available.
 /// </summary>
 public partial class NuGetParser : IPackageParser
 {
     private readonly ILogger<NuGetParser> _logger;
+    private readonly HashSet<string> _parsedLockFiles = [];
 
     public PackageEcosystem Ecosystem => PackageEcosystem.NuGet;
 
     public IReadOnlyList<string> SupportedPatterns =>
-        ["*.csproj", "*.fsproj", "*.vbproj", "packages.config", "Directory.Packages.props"];
+        ["packages.lock.json", "*.csproj", "*.fsproj", "*.vbproj", "packages.config", "Directory.Packages.props"];
 
     public NuGetParser(ILogger<NuGetParser> logger)
     {
@@ -32,7 +34,8 @@ public partial class NuGetParser : IPackageParser
         var fileName = Path.GetFileName(filePath);
         var ext = Path.GetExtension(filePath).ToLowerInvariant();
 
-        return ext is ".csproj" or ".fsproj" or ".vbproj" ||
+        return fileName == "packages.lock.json" ||
+               ext is ".csproj" or ".fsproj" or ".vbproj" ||
                fileName is "packages.config" or "Directory.Packages.props";
     }
 
@@ -45,16 +48,32 @@ public partial class NuGetParser : IPackageParser
         var packages = new List<Package>();
         var fileName = Path.GetFileName(filePath);
         var ext = Path.GetExtension(filePath).ToLowerInvariant();
+        var directory = Path.GetDirectoryName(filePath) ?? "";
 
         try
         {
-            if (fileName == "packages.config")
+            if (fileName == "packages.lock.json")
             {
-                packages.AddRange(ParsePackagesConfig(fileContent));
+                // Parse lock file - this is the source of truth
+                _logger.LogDebug("Parsing NuGet lock file: {Path}", filePath);
+                packages.AddRange(ParsePackagesLockJson(fileContent, filePath));
+                _parsedLockFiles.Add(directory);
             }
             else if (ext is ".csproj" or ".fsproj" or ".vbproj")
             {
+                // Check if lock file exists in same directory - skip if so
+                var lockFilePath = Path.Combine(repositoryRoot, directory, "packages.lock.json");
+                if (File.Exists(lockFilePath))
+                {
+                    _logger.LogDebug("Skipping {Path} - will use packages.lock.json instead", filePath);
+                    return packages;
+                }
+
                 packages.AddRange(ParseProjectFile(fileContent, repositoryRoot, filePath));
+            }
+            else if (fileName == "packages.config")
+            {
+                packages.AddRange(ParsePackagesConfig(fileContent));
             }
             else if (fileName == "Directory.Packages.props")
             {
@@ -67,6 +86,126 @@ public partial class NuGetParser : IPackageParser
         }
 
         return packages;
+    }
+
+    private List<Package> ParsePackagesLockJson(string content, string lockFilePath)
+    {
+        var packageMap = new Dictionary<string, Package>(StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            using var doc = JsonDocument.Parse(content);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("dependencies", out var dependencies))
+            {
+                _logger.LogWarning("No dependencies found in {Path}", lockFilePath);
+                return [];
+            }
+
+            // Iterate through target frameworks (e.g., "net8.0")
+            foreach (var tfm in dependencies.EnumerateObject())
+            {
+                var targetFramework = tfm.Name;
+                _logger.LogDebug("Parsing dependencies for {TFM}", targetFramework);
+
+                // First pass: Create all packages
+                foreach (var pkg in tfm.Value.EnumerateObject())
+                {
+                    var name = pkg.Name;
+                    
+                    var resolved = pkg.Value.TryGetProperty("resolved", out var resolvedProp) 
+                        ? resolvedProp.GetString() 
+                        : null;
+
+                    if (string.IsNullOrEmpty(resolved))
+                    {
+                        continue;
+                    }
+
+                    var key = $"{name}@{resolved}";
+                    if (packageMap.ContainsKey(key))
+                    {
+                        continue; // Already added from another TFM
+                    }
+
+                    // Determine if direct or transitive
+                    var type = pkg.Value.TryGetProperty("type", out var typeProp) 
+                        ? typeProp.GetString() 
+                        : "Transitive";
+                    var isDirect = type?.Equals("Direct", StringComparison.OrdinalIgnoreCase) == true;
+
+                    // Get content hash for integrity
+                    var contentHash = pkg.Value.TryGetProperty("contentHash", out var hashProp) 
+                        ? hashProp.GetString() 
+                        : null;
+
+                    var package = new Package
+                    {
+                        Name = name,
+                        Version = resolved,
+                        Ecosystem = PackageEcosystem.NuGet,
+                        IsDirect = isDirect,
+                        Purl = $"pkg:nuget/{name}@{resolved}",
+                        Sha256 = contentHash,
+                        DownloadUrl = $"https://api.nuget.org/v3-flatcontainer/{name.ToLowerInvariant()}/{resolved.ToLowerInvariant()}/{name.ToLowerInvariant()}.{resolved.ToLowerInvariant()}.nupkg"
+                    };
+
+                    packageMap[key] = package;
+                }
+
+                // Second pass: Build dependency relationships
+                foreach (var pkg in tfm.Value.EnumerateObject())
+                {
+                    var name = pkg.Name;
+                    var resolved = pkg.Value.TryGetProperty("resolved", out var resolvedProp) 
+                        ? resolvedProp.GetString() 
+                        : null;
+
+                    if (string.IsNullOrEmpty(resolved))
+                    {
+                        continue;
+                    }
+
+                    var key = $"{name}@{resolved}";
+                    if (!packageMap.TryGetValue(key, out var package))
+                    {
+                        continue;
+                    }
+
+                    // Parse this package's dependencies
+                    if (pkg.Value.TryGetProperty("dependencies", out var deps))
+                    {
+                        foreach (var dep in deps.EnumerateObject())
+                        {
+                            var depName = dep.Name;
+                            var depVersion = dep.Value.GetString();
+
+                            // Find the resolved package
+                            var depKey = $"{depName}@{depVersion}";
+                            packageMap.TryGetValue(depKey, out var resolvedDep);
+
+                            package.Dependencies.Add(new PackageDependency
+                            {
+                                Name = depName,
+                                VersionRange = depVersion,
+                                ResolvedVersion = resolvedDep?.Version ?? depVersion
+                            });
+                        }
+                    }
+                }
+
+                // Only parse first TFM to avoid duplicates
+                break;
+            }
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogError(ex, "Failed to parse packages.lock.json: {Path}", lockFilePath);
+        }
+
+        _logger.LogInformation("Parsed {Count} packages from {Path}", packageMap.Count, lockFilePath);
+        return packageMap.Values.ToList();
     }
 
     private IEnumerable<Package> ParsePackagesConfig(string content)
@@ -213,6 +352,26 @@ public partial class NuGetParser : IPackageParser
     public async Task<IReadOnlyList<Package>> ResolveTransitiveDependenciesAsync(
         IReadOnlyList<Package> packages,
         CancellationToken cancellationToken = default)
+    {
+        // Check if packages came from a lock file (they'll have content hashes and dependencies already)
+        var allFromLockFile = packages.All(p => 
+            !string.IsNullOrEmpty(p.Sha256) || p.Dependencies.Count > 0);
+
+        if (allFromLockFile)
+        {
+            // Lock file already contains complete dependency tree - no API calls needed
+            _logger.LogDebug("Packages from lock file - skipping NuGet API resolution");
+            return packages.ToList();
+        }
+
+        // No lock file - need to resolve from NuGet API (fallback behavior)
+        _logger.LogDebug("No lock file - resolving dependencies from NuGet API");
+        return await ResolveFromNuGetApiAsync(packages, cancellationToken);
+    }
+
+    private async Task<IReadOnlyList<Package>> ResolveFromNuGetApiAsync(
+        IReadOnlyList<Package> packages,
+        CancellationToken cancellationToken)
     {
         var allPackages = new Dictionary<string, Package>(StringComparer.OrdinalIgnoreCase);
         var toResolve = new Queue<Package>(packages);

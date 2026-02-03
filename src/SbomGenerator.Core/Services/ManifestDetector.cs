@@ -19,6 +19,7 @@ public class ManifestDetector : IManifestDetector
         { "package-lock.json", (PackageEcosystem.Npm, "package-lock.json") },
 
         // NuGet
+        { "packages.lock.json", (PackageEcosystem.NuGet, "packages.lock.json") },
         { "*.csproj", (PackageEcosystem.NuGet, "csproj") },
         { "*.fsproj", (PackageEcosystem.NuGet, "fsproj") },
         { "*.vbproj", (PackageEcosystem.NuGet, "vbproj") },
